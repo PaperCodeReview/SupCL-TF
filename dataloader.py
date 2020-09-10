@@ -1,8 +1,10 @@
 import os
-import sys
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+
+from augment import SimAugment
+from augment import RandAugment
 
 AUTO = tf.data.experimental.AUTOTUNE
 
@@ -31,19 +33,14 @@ def fetch_dataset(path, y):
 
 def dataloader(args, datalist, mode, batch_size, shuffle=True):
     '''dataloader for cross-entropy loss
-    '''
-    sys.path.append(args.baseline_path)
-    from generator.augment import SimAugment
-    
+    '''    
     def augmentation(img, label, shape):
         if args.augment == 'sim':
             augment = SimAugment(args, mode)
+        elif args.augment == 'rand':
+            augment = RandAugment(args, mode)
 
-        for f in augment.augment_list:
-            if 'crop' in f.__name__:
-                img = f(img, shape)
-            else:
-                img = f(img)
+        img = augment(img, shape)
         
         # one-hot encodding
         label = tf.one_hot(label, args.classes)
@@ -73,24 +70,19 @@ def dataloader(args, datalist, mode, batch_size, shuffle=True):
 def dataloader_supcon(args, datalist, mode, batch_size, shuffle=True):
     '''dataloader for supervised contrastive loss
     '''
-    sys.path.append(args.baseline_path)
-    from generator.augment import SimAugment
-    
     def augmentation(img, shape):
         if args.augment == 'sim':
             augment = SimAugment(args, mode)
+        elif args.augment == 'rand':
+            augment = RandAugment(args, mode)
         
         result = []
         for _ in range(2):
             aug_img = tf.identity(img)
-            for f in augment.augment_list:
-                if 'crop' in f.__name__:
-                    aug_img = f(aug_img, shape)
-                else:
-                    aug_img = f(aug_img)
+            aug_img = augment(aug_img, shape)
             result.append(aug_img)
         
-        return tuple(result)
+        return result
 
     def preprocess_image(img, label):
         shape = tf.image.extract_jpeg_shape(img)

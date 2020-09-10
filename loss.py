@@ -9,7 +9,7 @@ def crossentropy(args):
     return _loss
 
 
-def supervised_contrastive(args):
+def supervised_contrastive(args, batch_size_per_replica):
     def _loss(labels, logits):
         labels = tf.reshape(labels, (-1, 1))
         # indicator for yi=yj
@@ -28,7 +28,7 @@ def supervised_contrastive(args):
         mask = tf.tile(mask, (2, 2))
 
         # indicator for i \neq j
-        logits_mask = tf.ones_like(mask)-tf.eye(args.batch_size*2)
+        logits_mask = tf.ones_like(mask)-tf.eye(batch_size_per_replica*2)
         mask *= logits_mask
 
         # compute log_prob
@@ -38,6 +38,6 @@ def supervised_contrastive(args):
         exp_logits = tf.math.exp(anchor_dot_contrast) * logits_mask
         log_prob = anchor_dot_contrast - tf.math.log(tf.math.reduce_sum(exp_logits, axis=-1, keepdims=True))
         mean_log_prob = tf.reduce_sum(mask * log_prob, axis=-1) / tf.reduce_sum(mask, axis=-1)
-        loss = -tf.reduce_mean(tf.reshape(mean_log_prob, (2, args.batch_size)), axis=0)
+        loss = -tf.reduce_mean(tf.reshape(mean_log_prob, (2, batch_size_per_replica)), axis=0)
         return loss
     return _loss

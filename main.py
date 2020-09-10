@@ -1,71 +1,27 @@
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import sys
 import tqdm
 import argparse
-import numpy as np
-from datetime import datetime
 
+from common import set_seed
+from common import get_logger
+from common import get_session
+from common import search_same
+from common import create_stamp
 from dataloader import set_dataset
 from dataloader import dataloader
 from dataloader import dataloader_supcon
+from model import create_model
 from loss import crossentropy
 from loss import supervised_contrastive
+from callback import OptionalLearningRateSchedule
+from callback import create_callbacks
 
 import tensorflow as tf
 
 
-model_dict = {
-    'vgg16'         : tf.keras.applications.VGG16,
-    'vgg19'         : tf.keras.applications.VGG19,
-    'resnet50'      : tf.keras.applications.ResNet50,
-    'resnet50v2'    : tf.keras.applications.ResNet50V2,
-    'resnet101'     : tf.keras.applications.ResNet101,
-    'resnet101v2'   : tf.keras.applications.ResNet101V2,
-    'resnet152'     : tf.keras.applications.ResNet152,
-    'resnet152v2'   : tf.keras.applications.ResNet152V2,
-    'xception'      : tf.keras.applications.Xception, # 299
-    'densenet121'   : tf.keras.applications.DenseNet121, # 224
-    'densenet169'   : tf.keras.applications.DenseNet169, # 224
-    'densenet201'   : tf.keras.applications.DenseNet201, # 224
-}
-
-def create_model(args, logger):
-    from tensorflow.keras.layers import Dense
-    from tensorflow.keras.layers import Activation
-    from tensorflow.keras.layers import Lambda
-    from tensorflow.keras.models import Model
-
-    backbone = model_dict[args.backbone](
-        include_top=False,
-        pooling='avg',
-        weights=None,
-        input_shape=(args.img_size, args.img_size, 3))
-
-    if args.loss == 'crossentropy':
-        x = Dense(args.classes)(backbone.output)
-        x = Activation('softmax', name='main_output')(x)
-    elif args.loss == 'supcon':
-        x = Dense(2048, name='proj_hidden')(backbone.output)
-        x = Dense(128, name='proj_output')(x)
-        x = Lambda(lambda x: tf.math.l2_normalize(x, axis=-1), name='main_output')(x)
-    model = Model(backbone.input, x, name=args.backbone)
-
-    if args.snapshot:
-        model.load_weights(args.snapshot)
-        logger.info('Load weights at {}'.format(args.snapshot))
-    return model
-
-
 def main(args):
-    sys.path.append(args.baseline_path)
-    from common import get_logger
-    from common import get_session
-    from common import search_same
-    from callback_eager import OptionalLearningRateSchedule
-    from callback_eager import create_callbacks
-
     args, initial_epoch = search_same(args)
     if initial_epoch == -1:
         # training was already finished!
@@ -73,58 +29,45 @@ def main(args):
 
     elif initial_epoch == 0:
         # first training or training with snapshot
-        weekday = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-        temp = datetime.now()
-        args.stamp = "{:02d}{:02d}{:02d}_{}_{:02d}_{:02d}_{:02d}".format(
-            temp.year // 100,
-            temp.month,
-            temp.day,
-            weekday[temp.weekday()],
-            temp.hour,
-            temp.minute,
-            temp.second,
-        )
+        args.stamp = create_stamp()
 
     get_session(args)
     logger = get_logger("MyLogger")
     for k, v in vars(args).items():
         logger.info("{} : {}".format(k, v))
 
+
+    ##########################
+    # Strategy
+    ##########################
+    # strategy = tf.distribute.MirroredStrategy()
+    strategy = tf.distribute.experimental.CentralStorageStrategy()
+    assert args.batch_size % strategy.num_replicas_in_sync == 0
+
+    logger.info('{} : {}'.format(strategy.__class__.__name__, strategy.num_replicas_in_sync))
+    logger.info("GLOBAL BATCH SIZE : {}".format(args.batch_size))
+    logger.info("BATCH SIZE PER REPLICA : {}".format(args.batch_size // strategy.num_replicas_in_sync))
+
+
     ##########################
     # Dataset
     ##########################
     trainset, valset = set_dataset(args)
-
-    ##########################
-    # Model & Metric & Generator
-    ##########################
-    progress_desc_train = 'Train : Loss {:.4f}'
-    progress_desc_val = 'Val : Loss {:.4f}'
-    if args.loss == 'crossentropy':
-        progress_desc_train += ' | Acc {:.4f}'
-        progress_desc_val += ' | Acc {:.4f}'
-
-    # select your favorite distribution strategy
-    strategy = tf.distribute.MirroredStrategy()
-    # strategy = tf.distribute.experimental.CentralStorageStrategy()
-    logger.info('{} : {}'.format(strategy.__class__.__name__, strategy.num_replicas_in_sync))
-    global_batch_size = args.batch_size * strategy.num_replicas_in_sync
-    logger.info("GLOBAL BATCH SIZE : {}".format(global_batch_size))
+    steps_per_epoch = args.steps or len(trainset) // args.batch_size
+    validation_steps = len(valset) // args.batch_size
 
     logger.info("TOTAL STEPS OF DATASET FOR TRAINING")
     logger.info("========== trainset ==========")
-    steps_per_epoch = args.steps or len(trainset) // global_batch_size
     logger.info("    --> {}".format(len(trainset)))
     logger.info("    --> {}".format(steps_per_epoch))
 
     logger.info("=========== valset ===========")
-    validation_steps = len(valset) // global_batch_size
     logger.info("    --> {}".format(len(valset)))
     logger.info("    --> {}".format(validation_steps))
 
-    # lr scheduler
-    lr_scheduler = OptionalLearningRateSchedule(args, steps_per_epoch, initial_epoch)
-
+    ##########################
+    # Model & Metric & Generator
+    ##########################
     with strategy.scope():
         model = create_model(args, logger)
         if args.summary:
@@ -138,6 +81,7 @@ def main(args):
         }
 
         # optimizer
+        lr_scheduler = OptionalLearningRateSchedule(args, steps_per_epoch, initial_epoch)
         if args.optimizer == 'sgd':
             optimizer = tf.keras.optimizers.SGD(lr_scheduler, momentum=.9, decay=.0001)
         elif args.optimizer == 'rmsprop':
@@ -147,7 +91,7 @@ def main(args):
 
         # loss
         if args.loss == 'supcon':
-            criterion = supervised_contrastive(args)
+            criterion = supervised_contrastive(args, args.batch_size // strategy.num_replicas_in_sync)
         else:
             criterion = crossentropy(args)
             metrics['acc'] = tf.keras.metrics.CategoricalAccuracy('acc', dtype=tf.float32)
@@ -155,11 +99,11 @@ def main(args):
 
         # generator
         if args.loss == 'crossentropy':
-            train_generator = dataloader(args, trainset, 'train', global_batch_size)
-            val_generator = dataloader(args, valset, 'val', global_batch_size, shuffle=False)
+            train_generator = dataloader(args, trainset, 'train', args.batch_size)
+            val_generator = dataloader(args, valset, 'val', args.batch_size, shuffle=False)
         elif args.loss =='supcon':
-            train_generator = dataloader_supcon(args, trainset, 'train', global_batch_size)
-            val_generator = dataloader_supcon(args, valset, 'train', global_batch_size, shuffle=False)
+            train_generator = dataloader_supcon(args, trainset, 'train', args.batch_size)
+            val_generator = dataloader_supcon(args, valset, 'train', args.batch_size, shuffle=False)
         else:
             raise ValueError()
         
@@ -175,42 +119,39 @@ def main(args):
     train_iterator = iter(train_generator)
     val_iterator = iter(val_generator)
         
-    @tf.function
-    def do_step(iterator, mode, loss_name, acc_name=None):
+    # @tf.function
+    def do_step(iterator, mode):
+        def get_loss(inputs, labels, training=True):
+            logits = tf.cast(model(inputs, training=training), tf.float32)
+            loss = criterion(labels, logits)
+            loss_mean = tf.nn.compute_average_loss(loss, global_batch_size=args.batch_size)
+            return logits, loss, loss_mean
+
         def step_fn(from_iterator):
             if args.loss == 'supcon':
                 (img1, img2), labels = from_iterator
                 inputs = tf.concat([img1, img2], axis=0)
             else:
                 inputs, labels = from_iterator
-
+            
             if mode == 'train':
                 with tf.GradientTape() as tape:
-                    logits = tf.cast(model(inputs, training=True), tf.float32)
-                    loss = criterion(labels, logits)
-                    loss = tf.nn.compute_average_loss(loss, global_batch_size=global_batch_size)
+                    logits, loss, loss_mean = get_loss(inputs, labels)
 
-                grads = tape.gradient(loss, model.trainable_variables)
+                grads = tape.gradient(loss_mean, model.trainable_variables)
                 optimizer.apply_gradients(list(zip(grads, model.trainable_variables)))
             else:
-                logits = tf.cast(model(inputs, training=False), tf.float32)
-                loss = criterion(labels, logits)
-                loss = tf.nn.compute_average_loss(loss, global_batch_size=global_batch_size)
+                logits, loss, loss_mean = get_loss(inputs, labels, training=False)
 
-            metrics[loss_name].update_state(loss * strategy.num_replicas_in_sync)
-            # metrics[loss_name].update_state(loss)
             if args.loss == 'crossentropy':
-                metrics[acc_name].update_state(labels, logits)
+                metrics['acc' if mode == 'train' else 'val_acc'].update_state(labels, logits)
 
-        strategy.run(step_fn, args=(next(iterator),))
-        # step_fn(next(iterator))
+            return loss
 
-    def desc_update(pbar, desc, loss, acc=None):
-        if args.loss == 'supcon':
-            pbar.set_description(desc.format(loss.result()))
-        else:
-            pbar.set_description(desc.format(loss.result(), acc.result()))
-
+        loss_per_replica = strategy.run(step_fn, args=(next(iterator),))
+        loss_mean = strategy.reduce(tf.distribute.ReduceOp.MEAN, loss_per_replica, axis=0)
+        metrics['loss' if mode == 'train' else 'val_loss'].update_state(loss_mean)
+        
 
     ##########################
     # Train
@@ -220,28 +161,31 @@ def main(args):
         print('Learning Rate : {}'.format(optimizer.learning_rate(optimizer.iterations)))
 
         # train
-        progressbar_train = tqdm.tqdm(
-            tf.range(steps_per_epoch), 
-            desc=progress_desc_train.format(0, 0, 0, 0), 
-            leave=True)
-        for step in progressbar_train:
-            do_step(train_iterator, 'train', 'loss', 'acc')
-            # train_step(train_iterator)
-            desc_update(progressbar_train, progress_desc_train, metrics['loss'], 
-                        None if args.loss == 'supcon' else metrics['acc'])
-            progressbar_train.refresh()
+        print('Train')
+        progBar_train = tf.keras.utils.Progbar(steps_per_epoch, stateful_metrics=metrics.keys())
+        for step in range(steps_per_epoch):
+            do_step(train_iterator, 'train')
+            progBar_train.update(step, values=[(k, v.result()) for k, v in metrics.items() if not 'val' in k])
 
-        # eval
-        progressbar_val = tqdm.tqdm(
-            tf.range(validation_steps), 
-            desc=progress_desc_val.format(0, 0), 
-            leave=True)
-        for step in progressbar_val:
-            do_step(val_iterator, 'val', 'val_loss', 'val_acc')
-            # eval_step(val_iterator)
-            desc_update(progressbar_val, progress_desc_val, metrics['val_loss'], 
-                        None if args.loss == 'supcon' else metrics['val_acc'])
-            progressbar_val.refresh()
+            if args.tensorboard and args.tb_interval > 0:
+                if (epoch*steps_per_epoch+step) % args.tb_interval == 0:
+                    with train_writer.as_default():
+                        for k, v in metrics.items():
+                            if not 'val' in k:
+                                tf.summary.scalar(k, v.result(), step=epoch*steps_per_epoch+step)
+
+        if args.tensorboard and args.tb_interval == 0:
+            with train_writer.as_default():
+                for k, v in metrics.items():
+                    if not 'val' in k:
+                        tf.summary.scalar(k, v.result(), step=epoch)
+
+        # val
+        print('\n\nValidation')
+        progBar_val = tf.keras.utils.Progbar(validation_steps, stateful_metrics=metrics.keys())
+        for step in range(validation_steps):
+            do_step(val_iterator, 'val')
+            progBar_val.update(step, values=[(k, v.result()) for k, v in metrics.items() if 'val' in k])
     
         # logs
         logs = {k: v.result().numpy() for k, v in metrics.items()}
@@ -284,15 +228,14 @@ def main(args):
             v.reset_states()
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--backbone",       type=str,       default='resnet50')
-    parser.add_argument("--batch-size",     type=int,       default=32,
+    parser.add_argument("--batch_size",     type=int,       default=32,
                         help="batch size per replica")
     parser.add_argument("--classes",        type=int,       default=200)
     parser.add_argument("--dataset",        type=str,       default='cub')
-    parser.add_argument("--img-size",       type=int,       default=224)
+    parser.add_argument("--img_size",       type=int,       default=224)
     parser.add_argument("--steps",          type=int,       default=0)
     parser.add_argument("--epochs",         type=int,       default=100)
 
@@ -302,23 +245,24 @@ if __name__ == "__main__":
     parser.add_argument("--temperature",    type=float,     default=0.007)
 
     parser.add_argument("--augment",        type=str,       default='sim')
+    parser.add_argument("--randaug_layer",  type=int,       default=2)
     parser.add_argument("--standardize",    type=str,       default='minmax1',      choices=['minmax1', 'minmax2', 'norm', 'eachnorm'])
 
     parser.add_argument("--checkpoint",     action='store_true')
     parser.add_argument("--history",        action='store_true')
     parser.add_argument("--tensorboard",    action='store_true')
-    parser.add_argument("--lr-mode",        type=str,       default='constant',     choices=['constant', 'exponential', 'cosine'])
-    parser.add_argument("--lr-value",       type=float,     default=.1)
-    parser.add_argument("--lr-interval",    type=str,       default='20,50,80')
-    parser.add_argument("--lr-warmup",      type=int,       default=0)
+    parser.add_argument("--tb_interval",    type=int,       default=0)
+    parser.add_argument("--lr_mode",        type=str,       default='constant',     choices=['constant', 'exponential', 'cosine'])
+    parser.add_argument("--lr_value",       type=float,     default=.1)
+    parser.add_argument("--lr_interval",    type=str,       default='20,50,80')
+    parser.add_argument("--lr_warmup",      type=int,       default=0)
 
-    parser.add_argument('--baseline-path',  type=str,       default='/workspace/src/Challenge/code_baseline')
-    parser.add_argument('--src-path',       type=str,       default='.')
-    parser.add_argument('--data-path',      type=str,       default=None)
-    parser.add_argument('--result-path',    type=str,       default='./result')
+    parser.add_argument('--src_path',       type=str,       default='.')
+    parser.add_argument('--data_path',      type=str,       default=None)
+    parser.add_argument('--result_path',    type=str,       default='./result')
     parser.add_argument('--snapshot',       type=str,       default=None)
     parser.add_argument("--gpus",           type=str,       default=-1)
     parser.add_argument("--summary",        action='store_true')
-    parser.add_argument("--ignore-search",  type=str,       default='')
+    parser.add_argument("--ignore_search",  type=str,       default='')
 
     main(parser.parse_args())
