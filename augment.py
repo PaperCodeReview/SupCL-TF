@@ -11,19 +11,27 @@ REPLACE_VALUE = 128
 mean_std = {
     'cub': [[0.48552202, 0.49934904, 0.43224954], 
             [0.18172876, 0.18109447, 0.19272076]],
+    'cifar100': [[0.50707516, 0.48654887, 0.44091784], 
+                 [0.20079844, 0.19834627, 0.20219835]],
+    'imagenet': [[0.485, 0.456, 0.406],
+                 [0.229, 0.224, 0.225]]
 }
 
 class Augment:
-    '''
+    """
     Augmentation ops for SimAugment and RandAugment.
-    Some operations is from https://github.com/google-research/fixmatch/blob/master/imagenet/augment/augment_ops.py.
-
-    Arguments
-        args
-        mode (str) : training or validation
-    '''
+    Some operations are implemented \
+    from https://github.com/google-research/fixmatch/blob/master/imagenet/augment/augment_ops.py.
+    """
     
     def __init__(self, args, mode):
+        """
+        Augmentation ops
+
+        Arguments
+            args : arguments
+            mode : training or validation
+        """
         self.args = args
         self.mode = mode
 
@@ -32,19 +40,8 @@ class Augment:
     def _standardize(self, x):
         x = tf.cast(x, tf.float32)
         x /= 255.
-        if self.args.standardize == 'minmax1':
-            pass
-        elif self.args.standardize == 'minmax2':
-            x -= .5
-            x /= .5
-        elif self.args.standardize == 'norm':
-            x -= self.mean
-            x /= self.std
-        elif self.args.standardize == 'eachnorm':
-            x = (x-tf.math.reduce_mean(x))/tf.math.reduce_std(x)
-        else:
-            raise ValueError()
-
+        x -= self.mean
+        x /= self.std
         return x
 
     ## need img shape ##
@@ -242,13 +239,14 @@ class Augment:
 
 
 class SimAugment(Augment):
-    '''SimAugment
+    """
+    SimAugment
     Data augmentation in SimCLR (https://arxiv.org/abs/2002.05709).
 
     Arguments
         args (Namespace) : a set of arguments for training or validation
         mode (str) : training or validation
-    '''
+    """
     def __init__(self, args, mode):
         super().__init__(args, mode)
         self.augment_list = []
@@ -281,7 +279,8 @@ class SimAugment(Augment):
 
 
 class RandAugment(Augment):
-    '''RandAugment (https://arxiv.org/abs/1909.13719)
+    """
+    RandAugment (https://arxiv.org/abs/1909.13719)
     This class is made by referring to 
     https://github.com/google-research/fixmatch/blob/master/imagenet/augment/augment_ops.py.
 
@@ -289,7 +288,7 @@ class RandAugment(Augment):
         args (Namespace) : a set of arguments for training or validation
         mode (str) : training or validation
         prob_to_apply (float, default=.5) : the probability for applying the augmented image
-    '''
+    """
     def __init__(self, args, mode, prob_to_apply=.5):
         super().__init__(args, mode)
         self.prob_to_apply = prob_to_apply

@@ -1,7 +1,6 @@
 import os
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import tqdm
 import argparse
 
 from common import set_seed
@@ -68,17 +67,24 @@ def main(args):
     ##########################
     # Model & Metric & Generator
     ##########################
+    # metrics
+    metrics = {
+        'loss'    :   tf.keras.metrics.Mean('loss', dtype=tf.float32),
+        'val_loss':   tf.keras.metrics.Mean('val_loss', dtype=tf.float32),
+    }
+
+    if args.loss == 'crossentropy':
+        metrics.update({
+            'acc1'      : tf.keras.metrics.TopKCategoricalAccuracy(1, 'acc1', dtype=tf.float32),
+            'acc5'      : tf.keras.metrics.TopKCategoricalAccuracy(5, 'acc5', dtype=tf.float32),
+            'val_acc1'  : tf.keras.metrics.TopKCategoricalAccuracy(1, 'val_acc1', dtype=tf.float32),
+            'val_acc5'  : tf.keras.metrics.TopKCategoricalAccuracy(5, 'val_acc5', dtype=tf.float32)})
+
     with strategy.scope():
         model = create_model(args, logger)
         if args.summary:
             model.summary()
             return
-
-        # metrics
-        metrics = {
-            'loss'    :   tf.keras.metrics.Mean('loss', dtype=tf.float32),
-            'val_loss':   tf.keras.metrics.Mean('val_loss', dtype=tf.float32),
-        }
 
         # optimizer
         lr_scheduler = OptionalLearningRateSchedule(args, steps_per_epoch, initial_epoch)
@@ -89,23 +95,17 @@ def main(args):
         elif args.optimizer == 'adam':
             optimizer = tf.keras.optimizers.Adam(lr_scheduler)
 
-        # loss
+        # loss & generator
         if args.loss == 'supcon':
             criterion = supervised_contrastive(args, args.batch_size // strategy.num_replicas_in_sync)
-        else:
-            criterion = crossentropy(args)
-            metrics['acc'] = tf.keras.metrics.CategoricalAccuracy('acc', dtype=tf.float32)
-            metrics['val_acc'] = tf.keras.metrics.CategoricalAccuracy('val_acc', dtype=tf.float32)
-
-        # generator
-        if args.loss == 'crossentropy':
-            train_generator = dataloader(args, trainset, 'train', args.batch_size)
-            val_generator = dataloader(args, valset, 'val', args.batch_size, shuffle=False)
-        elif args.loss =='supcon':
             train_generator = dataloader_supcon(args, trainset, 'train', args.batch_size)
             val_generator = dataloader_supcon(args, valset, 'train', args.batch_size, shuffle=False)
+        elif args.loss == 'crossentropy':
+            criterion = crossentropy(args)
+            train_generator = dataloader(args, trainset, 'train', args.batch_size)
+            val_generator = dataloader(args, valset, 'val', args.batch_size, shuffle=False)
         else:
-            raise ValueError()
+            raise ValueError()    
         
         train_generator = strategy.experimental_distribute_dataset(train_generator)
         val_generator = strategy.experimental_distribute_dataset(val_generator)
@@ -229,12 +229,18 @@ def main(args):
 
 
 if __name__ == "__main__":
+    def check_arguments(args):
+        assert args.src_path is not None, 'src_path must be entered.'
+        assert args.data_path is not None, 'data_path must be entered.'
+        assert args.result_path is not None, 'result_path must be entered.'
+        return args
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--backbone",       type=str,       default='resnet50')
     parser.add_argument("--batch_size",     type=int,       default=32,
                         help="batch size per replica")
     parser.add_argument("--classes",        type=int,       default=200)
-    parser.add_argument("--dataset",        type=str,       default='cub')
+    parser.add_argument("--dataset",        type=str,       default='imagenet')
     parser.add_argument("--img_size",       type=int,       default=224)
     parser.add_argument("--steps",          type=int,       default=0)
     parser.add_argument("--epochs",         type=int,       default=100)
@@ -246,7 +252,6 @@ if __name__ == "__main__":
 
     parser.add_argument("--augment",        type=str,       default='sim')
     parser.add_argument("--randaug_layer",  type=int,       default=2)
-    parser.add_argument("--standardize",    type=str,       default='minmax1',      choices=['minmax1', 'minmax2', 'norm', 'eachnorm'])
 
     parser.add_argument("--checkpoint",     action='store_true')
     parser.add_argument("--history",        action='store_true')
@@ -265,4 +270,4 @@ if __name__ == "__main__":
     parser.add_argument("--summary",        action='store_true')
     parser.add_argument("--ignore_search",  type=str,       default='')
 
-    main(parser.parse_args())
+    main(check_arguments(parser.parse_args()))

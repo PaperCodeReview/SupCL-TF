@@ -8,6 +8,5 @@ python main.py \
     --lr_mode cosine \
     --lr_warmup 5 \
     --loss supcon \
-    --standardize norm \
-    --data_path /workspace/data2/Dataset/cub/ \
+    --data_path /workspace/data/Dataset/imagenet/ \
     --gpus 0,1,2,3
